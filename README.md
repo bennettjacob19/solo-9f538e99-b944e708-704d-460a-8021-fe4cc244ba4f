@@ -26,6 +26,20 @@ docker compose up --build
    半关闭、回执（下行尾部）在延迟后才到达——上传“结束”与回执到达之间的
    时间差即慢链路效应。
 
+## 取消试传
+
+网页上“开始试传”后可点“取消试传”撤销本次试传（例如选错了文件）：
+
+* 浏览器发出取消后，服务端停止继续读文件，并中止本次试传对应的代理
+  TCP 会话：目标仍在建连时撤销拨号，已接通时立即终止连接（队列中待发
+  字节直接丢弃，不再冲刷）；其他试传/连接不受影响。
+* 取消与回执到达交错时，页面只给一个最终结果：**只有完整回执已确认才
+  显示成功**；否则显示“已取消”，已送出但未确认的数据标记为**结果未知**
+  （不宣称目标未收件）。结果 JSON 里带 `proxy_up.read/delivered`（代理
+  已读/已转发到目标连接的字节数）供参考。
+* 连接记录中该次连接状态为 `cancelled`，错误列显示取消原因；字节列在
+  已读与已转发不一致时会附“已转 N”。
+
 ## 关键语义（实现于 `proxy/app/engine.py`）
 
 * **延迟起算**：每个数据块的投递时刻 = 代理读到它的时刻 + 延迟；队列按
@@ -36,6 +50,10 @@ docker compose up --build
   转发半关闭；反向继续传输直到结束。
 * **断连释放**：正常结束或对端 RST 都会取消泵任务、清空队列、关闭两侧
   连接，并把连接移入历史表。
+* **取消（abort）**：`Connection.abort(reason)` 建连中撤销拨号、已接通
+  立即终止两侧连接，待发字节不冲刷；记录状态 `cancelled` 及原因。
+  每方向统计含 `delivered`（已写出字节），与 `bytes`（已读）对比可知
+  取消时有多少数据仍在缓冲。
 * **配置快照**：每条连接在 accept 时快照配置，整条连接沿用。
 
 ## 本地开发（不用 Docker）
@@ -51,11 +69,16 @@ cd proxy && LISTEN_PORT=17000 TARGET_HOST=127.0.0.1 TARGET_PORT=19000 \
 ## 自测
 
 ```bash
-python3 tests/selftest.py   # 需按上面方式起好接收端与代理（端口见脚本头注释）
+python3 tests/selftest.py          # 需按上面方式起好接收端与代理（端口见脚本头注释）
+python3 tests/test_cancel_dial.py  # 引擎级：建连中取消/拨号完成瞬间取消（独立运行，无需先起服务）
 ```
 
 覆盖：回执字节数/SHA-256 校验、延迟流水化（非按块累加）、64 KiB 缓冲上限
-与峰值、EOF 先冲刷再半关闭、连接级配置快照、并发上传、RST 断连释放。
+与峰值、EOF 先冲刷再半关闭、连接级配置快照、并发上传、RST 断连释放、
+取消（传输中终止连接且并发试传不受影响、取消与回执交错时结果唯一且自洽、
+回执确认后取消无效、取消后正常链路仍可用；建连中撤销拨号与拨号完成瞬间
+取消由 `tests/test_cancel_dial.py` 覆盖——端到端版本依赖真实网络里拨号
+挂起的链路，环境不支持时自动跳过）。
 
 ## API
 
@@ -63,8 +86,9 @@ python3 tests/selftest.py   # 需按上面方式起好接收端与代理（端�
 | --- | --- | --- |
 | GET | `/api/config` | 当前配置与监听状态 |
 | POST | `/api/config` | 更新配置（仅影响新连接） |
-| GET | `/api/connections` | 活动+历史连接：双向字节数、缓冲当前/峰值、回执尾部 |
-| POST | `/api/test-upload` |  multipart 上传文件，经代理试传并返回回执 |
+| GET | `/api/connections` | 活动+历史连接：双向字节数（含已转发 delivered）、缓冲当前/峰值、回执尾部 |
+| POST | `/api/test-upload` |  multipart 上传文件（可带 `upload_id` 表单字段），经代理试传并返回回执 |
+| POST | `/api/test-upload/cancel` | 按 `upload_id` 取消进行中的试传；已完成（回执已确认）则返回 `already_finished` |
 | POST | `/api/history/clear` | 清空历史连接 |
 
 ## 目录结构
@@ -75,7 +99,7 @@ proxy/
   Dockerfile
   requirements.txt
   app/
-    main.py             # FastAPI：配置/统计/试传/网页
+    main.py             # FastAPI：配置/统计/试传（可取消）/网页
     engine.py           # 延迟代理引擎（asyncio，无第三方依赖）
     static/index.html   # 网页
 receiver/

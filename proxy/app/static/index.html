@@ -16,11 +16,11 @@ button { padding: 6px 14px; cursor: pointer; font-size: 13px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { border: 1px solid #e0e0e0; padding: 3px 6px; text-align: left; vertical-align: top; }
 th { background: #f5f5f5; white-space: nowrap; }
-.ok { color: #0a7d2c; } .err { color: #c00; }
+.ok { color: #0a7d2c; } .err { color: #c00; } .warn { color: #b06000; }
 .muted { color: #777; font-size: 12px; }
 pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 .pill { padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
-.st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; }
+.st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; } .st-cancelled { background: #fff4e5; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -40,7 +40,11 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
 
 <div class="card">
   <h2>上传试传（浏览器 → 本服务 → 经延迟代理 → 目标，读取回执）</h2>
-  <input type="file" id="file"> <button id="upBtn">开始试传</button> <span id="upStatus"></span>
+  <input type="file" id="file"> <button id="upBtn">开始试传</button>
+  <button id="cancelBtn" disabled>取消试传</button> <span id="upStatus"></span>
+  <div class="muted" id="cancelHint" style="margin-top:4px"></div>
+  <div class="muted" style="margin-top:4px">取消后服务端停止读文件并中止对应代理 TCP 会话（建连中撤销拨号、已接通立即终止），其他试传不受影响；
+    只有完整回执已确认才显示成功，否则已送出数据标记为“结果未知”。</div>
   <pre id="upResult" style="display:none"></pre>
 </div>
 
@@ -99,9 +103,15 @@ const HEAD = `<tr><th>ID</th><th>状态</th><th>客户端</th><th>目标</th>` +
 
 function connRow(c) {
   const receipt = (c.receipt || "").slice(-160);
+  const upCell = (c.up.delivered !== undefined && c.up.delivered !== c.up.bytes)
+    ? `${fmtNum(c.up.bytes)}<br><span class="muted">已转 ${fmtNum(c.up.delivered)}</span>`
+    : fmtNum(c.up.bytes);
+  const downCell = (c.down.delivered !== undefined && c.down.delivered !== c.down.bytes)
+    ? `${fmtNum(c.down.bytes)}<br><span class="muted">已转 ${fmtNum(c.down.delivered)}</span>`
+    : fmtNum(c.down.bytes);
   return `<tr><td>${c.id}</td><td><span class="pill st-${c.state}">${c.state}</span></td>` +
     `<td>${esc(c.client)}</td><td>${esc(c.target)}</td>` +
-    `<td class="num">${fmtNum(c.up.bytes)}</td><td class="num">${fmtNum(c.down.bytes)}</td>` +
+    `<td class="num">${upCell}</td><td class="num">${downCell}</td>` +
     `<td class="num">${fmtNum(c.up.queued)} / ${fmtNum(c.up.peak)}</td>` +
     `<td class="num">${fmtNum(c.down.queued)} / ${fmtNum(c.down.peak)}</td>` +
     `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms}</td>` +
@@ -121,28 +131,66 @@ async function refresh() {
   } catch (e) { /* 下次刷新重试 */ }
 }
 
+let curUploadId = null;    // 进行中的试传 ID（供取消用）
+let cancelRequested = false;
+
 async function doUpload() {
   const f = $("file").files[0];
   if (!f) { alert("请先选择文件"); return; }
+  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  curUploadId = uploadId;
+  cancelRequested = false;
   $("upBtn").disabled = true;
+  $("cancelBtn").disabled = false;
+  $("cancelHint").textContent = "";
   $("upStatus").textContent = `试传中：${f.name}（${fmtNum(f.size)} 字节）…`;
   $("upResult").style.display = "none";
   try {
     const fd = new FormData();
     fd.append("file", f, f.name);
+    fd.append("upload_id", uploadId);
     const r = await fetch("/api/test-upload", {method: "POST", body: fd});
     const d = await r.json();
     const el = $("upResult");
     el.style.display = "block";
     el.textContent = JSON.stringify(d, null, 2);
-    $("upStatus").innerHTML = d.ok
-      ? `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`
-      : `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}</span>`;
+    // 最终结果只在这里给出一次：成功 / 已取消（结果未知）/ 失败
+    if (d.ok) {
+      $("upStatus").innerHTML = `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`;
+    } else if (d.cancelled) {
+      $("upStatus").innerHTML = `<span class="warn">已取消：已送出 ${fmtNum(d.bytes_sent)} 字节，未确认完整回执，目标实际收件情况未知</span>`;
+    } else {
+      $("upStatus").innerHTML = `<span class="err">失败：${esc(d.error || d.detail || ("HTTP " + r.status))}</span>`;
+    }
   } catch (e) {
-    $("upStatus").innerHTML = `<span class="err">请求失败：${esc(e.message)}</span>`;
+    // 请求本身中断：若已发过取消，按“已取消、结果未知”展示，不宣称目标未收件
+    $("upStatus").innerHTML = cancelRequested
+      ? `<span class="warn">已取消：请求中断，已送出数据的送达情况未知（未确认完整回执）</span>`
+      : `<span class="err">请求失败：${esc(e.message)}</span>`;
   } finally {
     $("upBtn").disabled = false;
+    $("cancelBtn").disabled = true;
+    curUploadId = null;
     refresh();
+  }
+}
+
+async function cancelUpload() {
+  const id = curUploadId;
+  if (!id) return;
+  cancelRequested = true;
+  $("cancelBtn").disabled = true;
+  try {
+    const r = await fetch("/api/test-upload/cancel", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({upload_id: id})});
+    const d = await r.json();
+    // 这里只给瞬态提示；最终结果以试传请求的返回为准（见 doUpload）
+    $("cancelHint").textContent = d.ok
+      ? "取消请求已受理，正在中止连接…"
+      : `取消未生效：${esc(d.detail || d.message || ("HTTP " + r.status))}`;
+  } catch (e) {
+    $("cancelHint").textContent = `取消请求发送失败：${esc(e.message)}`;
   }
 }
 
@@ -153,6 +201,7 @@ async function clearHistory() {
 
 $("saveBtn").onclick = saveConfig;
 $("upBtn").onclick = doUpload;
+$("cancelBtn").onclick = cancelUpload;
 $("clearBtn").onclick = clearHistory;
 loadConfig();
 refresh();

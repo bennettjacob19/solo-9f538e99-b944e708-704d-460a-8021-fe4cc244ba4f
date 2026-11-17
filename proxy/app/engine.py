@@ -10,6 +10,8 @@
 * 收到单向 EOF 后，先把该方向队列中待发字节全部写出，再转发半关闭
   (write_eof)；反向方向继续传输直到结束。
 * 断连（正常结束或对端 RST）时释放队列并关闭两侧连接。
+* 取消（abort）：建连中撤销拨号，已接通则立即终止两侧连接，队列中
+  待发字节直接丢弃（不冲刷）；连接记录状态为 cancelled 并带取消原因。
 """
 from __future__ import annotations
 
@@ -38,9 +40,10 @@ class ProxyConfig:
 
 @dataclass
 class DirectionStats:
-    bytes: int = 0    # 已读累计字节
-    peak: int = 0     # 应用缓冲峰值
-    queued: int = 0   # 当前缓冲字节
+    bytes: int = 0       # 已读累计字节
+    delivered: int = 0   # 已写出到对端连接的字节（取消时可判断送达下界）
+    peak: int = 0        # 应用缓冲峰值
+    queued: int = 0      # 当前缓冲字节
 
 
 @dataclass
@@ -50,7 +53,7 @@ class ConnInfo:
     cfg: ProxyConfig  # 建立时的配置快照
     started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
-    state: str = "active"  # active | closed | error
+    state: str = "active"  # active | closed | error | cancelled
     error: str | None = None
     up: DirectionStats = field(default_factory=DirectionStats)    # 客户端 -> 目标
     down: DirectionStats = field(default_factory=DirectionStats)  # 目标 -> 客户端
@@ -137,6 +140,7 @@ class DirectionPump:
             await self.writer.drain()
             self._queued -= len(chunk)
             self.stats.queued = self._queued
+            self.stats.delivered += len(chunk)
             if self.on_data is not None:
                 self.on_data(chunk)
             if self._queued < BUFFER_LIMIT:
@@ -151,9 +155,25 @@ class Connection:
         self.client_writer = client_writer
         self.target_reader = None
         self.target_writer = None
+        self.abort_reason: str | None = None
+        self._dial: asyncio.Task | None = None      # 建连中的拨号任务
+        self._pump_tasks: list[asyncio.Task] = []
         peer = client_writer.get_extra_info("peername")
         client = f"{peer[0]}:{peer[1]}" if peer else "?"
         self.info = ConnInfo(id=conn_id, client=client, cfg=dataclasses.replace(cfg))
+
+    def abort(self, reason: str):
+        """取消该连接：建连中撤销拨号，已接通则立即终止两侧连接。
+        队列中待发字节直接丢弃（不冲刷）。幂等；已结束的连接调用无效。"""
+        if self.info.ended_at is not None:
+            return
+        self.abort_reason = reason
+        if self._dial is not None and not self._dial.done():
+            self._dial.cancel()
+        for t in self._pump_tasks:
+            t.cancel()
+        self._close(self.client_writer)
+        self._close(self.target_writer)
 
     def _capture_downlink(self, data: bytes):
         tail = self.info.downlink_tail + data
@@ -162,16 +182,48 @@ class Connection:
     async def run(self):
         info = self.info
         cfg = info.cfg
+        if self.abort_reason is not None:  # run() 启动前已被取消
+            info.state = "cancelled"
+            info.error = self.abort_reason
+            self._close(self.client_writer)
+            await self._wait_closed(self.client_writer)
+            info.ended_at = time.time()
+            return
+        dial = asyncio.ensure_future(
+            asyncio.open_connection(cfg.target_host, cfg.target_port))
+        self._dial = dial
         try:
             self.target_reader, self.target_writer = await asyncio.wait_for(
-                asyncio.open_connection(cfg.target_host, cfg.target_port),
-                timeout=CONNECT_TIMEOUT,
-            )
+                dial, timeout=CONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            # abort()/shutdown 撤销了拨号
+            if self.abort_reason is not None:
+                info.state = "cancelled"
+                info.error = self.abort_reason
+            else:
+                info.state = "closed"
+            self._close(self.client_writer)
+            await self._wait_closed(self.client_writer)
+            info.ended_at = time.time()
+            return
         except Exception as exc:
             info.state = "error"
             info.error = f"connect target {cfg.target_host}:{cfg.target_port} failed: {exc}"
             self._close(self.client_writer)
             await self._wait_closed(self.client_writer)
+            info.ended_at = time.time()
+            return
+        finally:
+            self._dial = None
+        if self.abort_reason is not None:
+            # 拨号完成与 wait_for 恢复之间的间隙被取消：刚接通的目标连接
+            # 也要立即终止，不进入泵阶段
+            info.state = "cancelled"
+            info.error = self.abort_reason
+            self._close(self.client_writer)
+            self._close(self.target_writer)
+            await self._wait_closed(self.client_writer)
+            await self._wait_closed(self.target_writer)
             info.ended_at = time.time()
             return
 
@@ -181,8 +233,11 @@ class Connection:
                              cfg.down_delay_ms / 1000.0, info.down,
                              on_data=self._capture_downlink)
         tasks = [asyncio.create_task(up.run()), asyncio.create_task(down.run())]
+        self._pump_tasks = tasks
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass  # abort()/shutdown 取消了泵任务
         except Exception as exc:
             info.state = "error"
             info.error = f"{type(exc).__name__}: {exc}"
@@ -195,7 +250,10 @@ class Connection:
             self._close(self.target_writer)
             await self._wait_closed(self.client_writer)
             await self._wait_closed(self.target_writer)
-            if info.state == "active":
+            if self.abort_reason is not None:
+                info.state = "cancelled"
+                info.error = self.abort_reason
+            elif info.state == "active":
                 info.state = "closed"
             info.ended_at = time.time()
 
@@ -269,6 +327,34 @@ class DelayProxy:
         conn = self.active.pop(cid, None)
         if conn is not None:
             self.history.appendleft(conn.info)
+
+    def abort(self, conn_id: int, reason: str) -> bool:
+        """按连接 ID 中止活动连接；连接不存在或已结束返回 False。"""
+        conn = self.active.get(conn_id)
+        if conn is None:
+            return False
+        conn.abort(reason)
+        return True
+
+    def find_by_client_port(self, port: int, not_before: float = 0.0):
+        """按客户端源端口在活动连接中查找（用于定位某次试传对应的连接）。"""
+        for conn in self.active.values():
+            if conn.info.started_at < not_before:
+                continue
+            peer = conn.client_writer.get_extra_info("peername")
+            if peer and len(peer) >= 2 and peer[1] == port:
+                return conn
+        return None
+
+    def conn_info(self, conn_id: int) -> ConnInfo | None:
+        """按 ID 取连接记录（先活动后历史）。"""
+        conn = self.active.get(conn_id)
+        if conn is not None:
+            return conn.info
+        for info in self.history:
+            if info.id == conn_id:
+                return info
+        return None
 
     async def shutdown(self):
         if self.server is not None:

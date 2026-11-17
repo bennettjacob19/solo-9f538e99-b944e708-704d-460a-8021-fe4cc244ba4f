@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端自测：验证延迟代理的关键语义。
+"""端到端自测：验证延迟代理的关键语义与试传取消语义。
 
 前置（见 README）：
   * 示例接收端监听 127.0.0.1:19000
@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import random
 import socket
 import struct
 import sys
@@ -34,10 +35,11 @@ def check(name: str, cond: bool, detail: str = ""):
         failures.append(name)
 
 
-async def set_cfg(client: httpx.AsyncClient, *, up: float, down: float):
+async def set_cfg(client: httpx.AsyncClient, *, up: float, down: float,
+                  target_host: str = TARGET_HOST, target_port: int | None = None):
     r = await client.post("/api/config", json={
         "listen_host": "0.0.0.0", "listen_port": PROXY_PORT,
-        "target_host": TARGET_HOST, "target_port": int(TARGET_PORT),
+        "target_host": target_host, "target_port": int(target_port or TARGET_PORT),
         "up_delay_ms": up, "down_delay_ms": down})
     r.raise_for_status()
     d = r.json()
@@ -45,10 +47,18 @@ async def set_cfg(client: httpx.AsyncClient, *, up: float, down: float):
     return d
 
 
-async def upload(client: httpx.AsyncClient, payload: bytes, name="blob.bin"):
-    r = await client.post("/api/test-upload", files={"file": (name, payload)})
+async def upload(client: httpx.AsyncClient, payload: bytes, name="blob.bin",
+                 uid: str | None = None):
+    kw = {}
+    if uid is not None:
+        kw["data"] = {"upload_id": uid}
+    r = await client.post("/api/test-upload", files={"file": (name, payload)}, **kw)
     r.raise_for_status()
     return r.json()
+
+
+async def cancel(client: httpx.AsyncClient, uid: str):
+    return await client.post("/api/test-upload/cancel", json={"upload_id": uid})
 
 
 async def find_conn(client: httpx.AsyncClient, up_bytes: int, retries: int = 30):
@@ -57,6 +67,20 @@ async def find_conn(client: httpx.AsyncClient, up_bytes: int, retries: int = 30)
         d = (await client.get("/api/connections")).json()
         for c in d["history"] + d["active"]:
             if c["up"]["bytes"] == up_bytes:
+                return c
+        await asyncio.sleep(0.2)
+    return None
+
+
+async def find_conn_by_id(client: httpx.AsyncClient, cid: int | None,
+                          retries: int = 30):
+    """按连接 ID 定位一条连接（先历史后活动）。"""
+    if cid is None:
+        return None
+    for _ in range(retries):
+        d = (await client.get("/api/connections")).json()
+        for c in d["history"] + d["active"]:
+            if c["id"] == cid:
                 return c
         await asyncio.sleep(0.2)
     return None
@@ -155,6 +179,144 @@ async def main():
             active_ids = {c["id"] for c in (await client.get("/api/connections")).json()["active"]}
             check("reset connection released from active set", rst_conn["id"] not in active_ids,
                   f"state={rst_conn['state']} error={rst_conn['error']}")
+
+        # 6. 取消建连中的试传：目标指向黑洞地址使拨号挂起，取消应撤销拨号
+        blackhole = "192.0.2.1"  # TEST-NET-1 (RFC 5737)，通常不可路由
+        dial_hangs = False
+        try:  # 探测本环境对黑洞地址是“挂起”还是“快速失败/意外连通”
+            _r, _w = await asyncio.wait_for(asyncio.open_connection(blackhole, 9), 2)
+            _w.close()
+        except asyncio.TimeoutError:
+            dial_hangs = True
+        except Exception:
+            pass
+        if not dial_hangs:
+            print("[skip] cancel-while-dialling: 本环境对黑洞地址的拨号不挂起，跳过")
+        else:
+            await set_cfg(client, up=100, down=100,
+                          target_host=blackhole, target_port=9)
+            uid = "cancel-dial"
+            t0 = time.monotonic()
+            task = asyncio.create_task(upload(client, b"x" * 4096, "dial.bin", uid))
+            await asyncio.sleep(0.8)  # 让代理进入“目标建连中”
+            r = await cancel(client, uid)
+            check("cancel while dialling accepted",
+                  r.status_code == 200 and r.json().get("ok") is True, r.text[:200])
+            res = await asyncio.wait_for(task, 30)
+            dt = time.monotonic() - t0
+            check("dialling aborted fast (not 15s connect timeout)", dt < 10.0,
+                  f"{dt:.2f}s")
+            check("dial-cancel result is cancelled, not ok",
+                  res.get("cancelled") is True and res.get("ok") is False,
+                  str(res)[:240])
+            check("dial-cancel has no receipt, delivery unknown",
+                  not res.get("receipt") and res.get("delivery") == "unknown",
+                  str(res)[:240])
+            conn = await find_conn_by_id(client, res.get("proxy_conn_id"))
+            check("dial-cancel conn recorded as cancelled with reason",
+                  conn is not None and conn["state"] == "cancelled"
+                  and bool(conn.get("error")),
+                  f"{conn and conn['state']} {conn and conn.get('error')}")
+
+        # 7. 取消已接通、传输中的试传；并发的另一试传不受影响
+        await set_cfg(client, up=4000, down=4000)
+        payload_a = os.urandom(512 * 1024)
+        payload_b = os.urandom(256 * 1024)
+        sha_b = hashlib.sha256(payload_b).hexdigest()
+        ta = asyncio.create_task(upload(client, payload_a, "a.bin", "cancel-mid"))
+        tb = asyncio.create_task(upload(client, payload_b, "b.bin", "keep-me"))
+        flowing = False  # 等数据进入延迟线（上行已有字节）
+        for _ in range(60):
+            d = (await client.get("/api/connections")).json()
+            if any(c["up"]["bytes"] > 0 for c in d["active"]):
+                flowing = True
+                break
+            await asyncio.sleep(0.1)
+        check("mid-transfer upload flowing", flowing)
+        t0 = time.monotonic()
+        r = await cancel(client, "cancel-mid")
+        check("cancel mid-transfer accepted",
+              r.status_code == 200 and r.json().get("ok") is True, r.text[:200])
+        res_a = await asyncio.wait_for(ta, 30)
+        dt = time.monotonic() - t0
+        check("mid-transfer cancelled fast (normal would take >=4s)", dt < 3.5,
+              f"{dt:.2f}s")
+        check("mid-cancel result is cancelled, not ok",
+              res_a.get("cancelled") is True and res_a.get("ok") is False,
+              str(res_a)[:240])
+        check("mid-cancel sent some bytes, no receipt, delivery unknown",
+              res_a.get("bytes_sent", 0) > 0 and not res_a.get("receipt")
+              and res_a.get("delivery") == "unknown", str(res_a)[:240])
+        # 4s 上行延迟下，取消时首批数据尚未到投递时刻 -> 已转发应为 0
+        check("mid-cancel nothing delivered to target yet",
+              res_a.get("proxy_up", {}).get("delivered") == 0,
+              str(res_a.get("proxy_up")))
+        conn_a = await find_conn_by_id(client, res_a.get("proxy_conn_id"))
+        check("mid-cancel conn recorded as cancelled with reason",
+              conn_a is not None and conn_a["state"] == "cancelled"
+              and bool(conn_a.get("error")),
+              f"{conn_a and conn_a['state']} {conn_a and conn_a.get('error')}")
+        if conn_a:
+            check("mid-cancel delivered <= read invariant",
+                  conn_a["up"]["delivered"] <= conn_a["up"]["bytes"],
+                  str(conn_a["up"]))
+        res_b = await asyncio.wait_for(tb, 60)
+        check("concurrent upload unaffected, receipt correct",
+              res_b.get("ok") is True and sha_b in res_b.get("receipt", ""),
+              str(res_b)[:240])
+
+        # 8. 取消与回执交错
+        await set_cfg(client, up=400, down=400)
+        # 8a. 完整回执确认后再取消：结果仍是成功，取消无效
+        uid = "cancel-late"
+        payload = os.urandom(64 * 1024)
+        sha = hashlib.sha256(payload).hexdigest()
+        res = await upload(client, payload, "late.bin", uid)
+        check("late-cancel baseline upload ok", res.get("ok") is True
+              and sha in res.get("receipt", ""), str(res)[:200])
+        r = await cancel(client, uid)
+        check("cancel after confirmed receipt rejected",
+              r.status_code == 200 and r.json().get("ok") is False
+              and r.json().get("already_finished") is True, r.text[:200])
+        # 8b. 未知 upload_id：404
+        r = await cancel(client, "no-such-upload")
+        check("cancel unknown upload id -> 404", r.status_code == 404,
+              r.text[:120])
+        # 8c. 随机时刻取消的交错压力：每次试传只给一个最终结果，且结果自洽
+        #     —— ok 必须带完整正确回执；cancelled 必须无回执且标“结果未知”
+        rng = random.Random(20261117)
+        trials = 8
+        consistent = 0
+        outcomes = []
+        for i in range(trials):
+            uid = f"cancel-race-{i}"
+            payload = os.urandom(64 * 1024)
+            sha = hashlib.sha256(payload).hexdigest()
+            task = asyncio.create_task(upload(client, payload, f"r{i}.bin", uid))
+            await asyncio.sleep(rng.uniform(0.3, 2.2))
+            await cancel(client, uid)  # 可能生效，也可能因已完成而无效
+            res = await asyncio.wait_for(task, 30)
+            if res.get("ok"):
+                ok_consistent = (sha in res.get("receipt", "")
+                                 and not res.get("cancelled"))
+                outcomes.append("ok" if ok_consistent else "BAD-ok")
+            else:
+                ok_consistent = (res.get("cancelled") is True
+                                 and not res.get("receipt")
+                                 and res.get("delivery") == "unknown")
+                outcomes.append("cancelled" if ok_consistent else "BAD-cancel")
+            consistent += bool(ok_consistent)
+        check("race trials each give one consistent final result",
+              consistent == trials, f"{consistent}/{trials} {outcomes}")
+
+        # 9. 取消测试之后，正常链路（延迟/缓冲/半关闭取回执）仍工作
+        await set_cfg(client, up=300, down=300)
+        payload = os.urandom(128 * 1024)
+        sha = hashlib.sha256(payload).hexdigest()
+        res = await upload(client, payload, "post-cancel.bin")
+        check("normal upload still works after cancels",
+              res.get("ok") is True and sha in res.get("receipt", ""),
+              str(res)[:200])
 
         await set_cfg(client, up=300, down=300)  # 恢复默认
 
